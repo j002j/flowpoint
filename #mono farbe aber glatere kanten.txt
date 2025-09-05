@@ -1,0 +1,125 @@
+#mono farbe aber glatere kanten
+	
+import cv2
+from ultralytics import YOLO
+import numpy as np
+import random
+
+# YOLOv8 Modell laden
+model = YOLO("yolov8n.pt")
+
+# Videoquelle öffnen
+cap = cv2.VideoCapture(0)  # ggf. 1 für externe Kamera
+
+if not cap.isOpened():
+    print("Fehler: Kamera oder Video konnte nicht geöffnet werden.")
+    exit()
+
+# Trail-Layer für Nachleuchte
+trail_layer = None
+
+# Parameter
+fade_strength = 0.97     # höher = langsameres Verblassen
+max_track_length = 40    # wie viele Punkte gespeichert werden
+smoothing_factor = 0.3   # 0.0 = keine Glättung, 1.0 = sehr stark geglättet
+
+# Speicherung der Tracks pro Person (nach ID)
+tracks = {}
+id_colors = {}
+
+def get_color_for_id(track_id: int):
+    """Weise jeder ID eine feste Farbe zu"""
+    if track_id not in id_colors:
+        rng = random.Random(track_id)
+        color = (
+            rng.randint(100, 255),
+            rng.randint(100, 255),
+            rng.randint(100, 255)
+        )
+        id_colors[track_id] = color
+    return id_colors[track_id]
+
+def smooth_point(new_point, last_point, factor=0.3):
+    """Einfacher Low-Pass-Filter (Exponentielles Glätten)"""
+    if last_point is None:
+        return new_point
+    x = int(last_point[0] * (1 - factor) + new_point[0] * factor)
+    y = int(last_point[1] * (1 - factor) + new_point[1] * factor)
+    return (x, y)
+
+# Fullscreen-Fenster vorbereiten
+window_name = "WKD Summercamp 2025 ... Daniel, Giuliana, Jenny, Lea"
+cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+
+# Bildschirmauflösung definieren (hier Full HD, ggf. anpassen)
+screen_res = (1920, 1080)
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        print("Fehler: Frame konnte nicht gelesen werden.")
+        break
+
+    # Kamera spiegeln
+    frame = cv2.flip(frame, 1)
+
+    h, w, _ = frame.shape
+    if trail_layer is None:
+        # Trail-Layer mit weißem Hintergrund initialisieren
+        trail_layer = np.ones_like(frame, dtype=np.uint8) * 255
+
+    # YOLO mit Tracking
+    results = model.track(frame, persist=True, verbose=False)
+    result = results[0]
+
+    # Trail-Layer abdunkeln (Nachleuchte-Effekt)
+    trail_layer = cv2.addWeighted(trail_layer, fade_strength, np.ones_like(trail_layer) * 255, 1 - fade_strength, 0)
+
+    # Personen durchgehen
+    if hasattr(result, "boxes") and result.boxes.id is not None:
+        for box, cls, track_id in zip(result.boxes.xyxy, result.boxes.cls, result.boxes.id):
+            if int(cls) == 0:  # nur Personen
+                x1, y1, x2, y2 = map(int, box)
+                cx = (x1 + x2) // 2
+                cy = (y1 + y2) // 2
+
+                tid = int(track_id)
+                if tid not in tracks:
+                    tracks[tid] = []
+
+                # Punkt glätten
+                last_point = tracks[tid][-1] if tracks[tid] else None
+                smooth_pt = smooth_point((cx, cy), last_point, factor=smoothing_factor)
+
+                tracks[tid].append(smooth_pt)
+                if len(tracks[tid]) > max_track_length:
+                    tracks[tid].pop(0)
+
+                # Linie zeichnen (Glow + Kern)
+                pts = np.array(tracks[tid], np.int32).reshape((-1, 1, 2))
+                color = get_color_for_id(tid)
+
+                # Glow-Linie (breit, leicht transparent)
+                overlay = trail_layer.copy()
+                cv2.polylines(overlay, [pts], isClosed=False, color=color, thickness=12, lineType=cv2.LINE_AA)
+                trail_layer = cv2.addWeighted(overlay, 0.3, trail_layer, 0.7, 0)
+
+                # Mittlere Linie (leicht schmaler, kräftiger)
+                overlay = trail_layer.copy()
+                cv2.polylines(overlay, [pts], isClosed=False, color=color, thickness=6, lineType=cv2.LINE_AA)
+                trail_layer = cv2.addWeighted(overlay, 0.6, trail_layer, 0.4, 0)
+
+                # Kernlinie (ganz scharf, dünn, volle Deckkraft)
+                cv2.polylines(trail_layer, [pts], isClosed=False, color=color, thickness=2, lineType=cv2.LINE_AA)
+
+    # Auf Bildschirmauflösung skalieren
+    frame_resized = cv2.resize(trail_layer, screen_res, interpolation=cv2.INTER_LINEAR)
+    cv2.imshow(window_name, frame_resized)
+
+    # Mit "q" beenden
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
